@@ -4,9 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>IMA360 QA Agent</title>
+
+    <!-- Preconnect for faster font loading -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+    <!-- Geist font — clean, modern, professional -->
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+    <style>
+      /* Prevent flash of unstyled content */
+      body { opacity: 0; transition: opacity 0.15s ease; }
+      body.loaded { opacity: 1; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+    <script>
+      // Show content once fonts are ready
+      document.fonts.ready.then(() => {
+        document.body.classList.add('loaded')
+      })
+      // Fallback — show after 500ms regardless
+      setTimeout(() => document.body.classList.add('loaded'), 500)
+    </script>
   </body>
 </html>
