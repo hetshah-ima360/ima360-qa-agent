@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
+import { useLocalStorage } from '../lib/useLocalStorage.js'
 import { BPML_SCRIPTS, MODULES } from '../data/bpml_knowledge.js'
 import { buildDiagnosePrompt } from '../lib/prompts.js'
 
@@ -209,14 +210,17 @@ function downloadFile(name, content, mime = 'text/plain') {
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════════════════════
 export default function DiagnoseStory({ memories, onMemoryChange }) {
-  const [desc, setDesc] = useState('')
-  const [notes, setNotes] = useState('')
-  const [mod, setMod] = useState('')
-  const [rules, setRules] = useState('')
-  const [result, setResult] = useState(null)
+  // ── Persisted state (survives tab switches AND browser refresh) ──
+  const [desc, setDesc]     = useLocalStorage('diagnose:desc', '')
+  const [notes, setNotes]   = useLocalStorage('diagnose:notes', '')
+  const [mod, setMod]       = useLocalStorage('diagnose:mod', '')
+  const [rules, setRules]   = useLocalStorage('diagnose:rules', '')
+  const [result, setResult] = useLocalStorage('diagnose:result', null)
+  const [activeTab, setActiveTab] = useLocalStorage('diagnose:activeTab', 'understanding')
+
+  // ── Ephemeral state (does NOT need to persist) ──
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [activeTab, setActiveTab] = useState('understanding')
   const [scenarioFilter, setScenarioFilter] = useState({ type:'all', priority:'all' })
 
   const resultsRef = useRef(null)
@@ -288,7 +292,7 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
 
   function handleClear() {
     setDesc(''); setNotes(''); setMod(''); setRules('')
-    setResult(null); setError('')
+    setResult(null); setError(''); setActiveTab('understanding')
   }
 
   function exportAll() {
