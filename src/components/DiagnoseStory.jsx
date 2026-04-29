@@ -260,14 +260,54 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
       const r = await fetch('/api/chat', {
         method:'POST', headers:{ 'Content-Type':'application/json' },
         body: JSON.stringify({
-          model:'claude-sonnet-4-20250514', max_tokens:4096,
-          system:prompt, messages:[{ role:'user', content:userMsg }],
+          model:'claude-sonnet-4-20250514',
+          max_tokens: 16000,           // bumped from 4096 — 6 structured outputs need headroom
+          system: prompt,
+          messages:[{ role:'user', content:userMsg }],
         }),
       })
-      const data = await r.json()
-      if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`)
-      const text = (data.content || []).map(b => b.text || '').join('')
-      const parsed = JSON.parse(text.replace(/```json\s*/g,'').replace(/```\s*/g,'').trim())
+
+      // Read as text first so we can see what came back even if it isn't JSON
+      const raw = await r.text()
+      let data
+      try {
+        data = JSON.parse(raw)
+      } catch {
+        console.error('Non-JSON response from /api/chat:', raw)
+        throw new Error(`Server returned a non-JSON response: ${raw.slice(0, 200)}`)
+      }
+
+      if (!r.ok) {
+        throw new Error(data?.error?.message || data?.error || `HTTP ${r.status}`)
+      }
+
+      // Anthropic returns { content: [{ type: 'text', text: '...' }, ...] }
+      if (!data.content || !Array.isArray(data.content)) {
+        console.error('Unexpected response shape from /api/chat:', data)
+        throw new Error(data?.error || 'Anthropic returned an unexpected response shape')
+      }
+
+      const text = data.content.map(b => b.text || '').join('').trim()
+      if (!text) throw new Error('Anthropic returned an empty response')
+
+      // Strip markdown fences if present
+      const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
+
+      let parsed
+      try {
+        parsed = JSON.parse(cleaned)
+      } catch {
+        console.error('Failed to parse Claude response as JSON. Raw text:', text)
+        // Recover: try to find a JSON object inside the text (Claude sometimes wraps with prose)
+        const match = cleaned.match(/\{[\s\S]*\}/)
+        if (match) {
+          try { parsed = JSON.parse(match[0]) }
+          catch { throw new Error(`Response was not valid JSON. First 200 chars: ${text.slice(0, 200)}`) }
+        } else {
+          throw new Error(`Response was not valid JSON. First 200 chars: ${text.slice(0, 200)}`)
+        }
+      }
+
       setResult(parsed)
 
       // Auto-save to memory
