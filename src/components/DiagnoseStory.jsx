@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
 import { useLocalStorage } from '../lib/useLocalStorage.js'
+import { streamChat, extractJson } from '../lib/streamChat.js'
 import { BPML_SCRIPTS, MODULES } from '../data/bpml_knowledge.js'
 import { buildDiagnosePrompt } from '../lib/prompts.js'
 
@@ -222,6 +223,15 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [scenarioFilter, setScenarioFilter] = useState({ type:'all', priority:'all' })
+  const [streamPreview, setStreamPreview] = useState('')
+
+  // ── History state ──
+  const [history, setHistory] = useState([])
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [currentSessionId, setCurrentSessionId] = useState(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const historyBtnRef = useRef(null)
+  const historyDropdownRef = useRef(null)
 
   const resultsRef = useRef(null)
 
@@ -234,6 +244,88 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
       resultsRef.current.scrollIntoView({ behavior:'smooth', block:'start' })
     }
   }, [result])
+
+  // Load history list on mount
+  useEffect(() => {
+    loadHistory()
+  }, [])
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    if (!historyOpen) return
+    function onClick(e) {
+      if (
+        historyDropdownRef.current && !historyDropdownRef.current.contains(e.target) &&
+        historyBtnRef.current && !historyBtnRef.current.contains(e.target)
+      ) {
+        setHistoryOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [historyOpen])
+
+  async function loadHistory() {
+    try {
+      setHistoryLoading(true)
+      const r = await fetch('/api/sessions?kind=diagnose')
+      const d = await r.json()
+      if (d.sessions) setHistory(d.sessions)
+    } catch (e) {
+      console.error('Failed to load diagnosis history:', e)
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  async function loadDiagnosis(sessionId) {
+    try {
+      setHistoryOpen(false)
+      const r = await fetch(`/api/sessions?id=${sessionId}`)
+      const d = await r.json()
+      if (!d.messages || d.messages.length < 2) {
+        setError('Could not load diagnosis: messages missing')
+        return
+      }
+      // First message is user input (JSON-encoded), second is assistant result (JSON-encoded)
+      const userMsg = d.messages.find(m => m.role === 'user')
+      const asstMsg = d.messages.find(m => m.role === 'assistant')
+      if (!userMsg || !asstMsg) {
+        setError('Could not load diagnosis: malformed history')
+        return
+      }
+      let inputJson, resultJson
+      try { inputJson = JSON.parse(userMsg.content) } catch { inputJson = null }
+      try { resultJson = JSON.parse(asstMsg.content) } catch { resultJson = null }
+      if (!resultJson) {
+        setError('Could not load diagnosis: result is unreadable')
+        return
+      }
+      // Restore form
+      setDesc(inputJson?.desc || '')
+      setNotes(inputJson?.notes || '')
+      setMod(inputJson?.mod || '')
+      setRules(inputJson?.rules || '')
+      setResult(resultJson)
+      setActiveTab('understanding')
+      setCurrentSessionId(sessionId)
+      setError('')
+    } catch (e) {
+      setError('Failed to load diagnosis: ' + e.message)
+    }
+  }
+
+  async function deleteDiagnosis(sessionId, e) {
+    e?.stopPropagation()
+    if (!confirm('Delete this diagnosis from history?')) return
+    try {
+      await fetch(`/api/sessions?id=${sessionId}`, { method: 'DELETE' })
+      setHistory(history.filter(h => h.id !== sessionId))
+      if (currentSessionId === sessionId) setCurrentSessionId(null)
+    } catch (e) {
+      console.error('Failed to delete diagnosis:', e)
+    }
+  }
 
   // Filtered scenarios
   const filteredScenarios = useMemo(() => {
@@ -253,62 +345,22 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
   async function handleGenerate() {
     if (!canSubmit) return
     setLoading(true); setError(''); setResult(null); setActiveTab('understanding')
+    setStreamPreview('')
     const prompt = buildDiagnosePrompt(memories)
     const userMsg = `STORY TO ANALYSE:\n\n${desc}\n\n${notes ? `ACCEPTANCE CRITERIA / NOTES:\n${notes}\n` : ''}${mod ? `MODULE: ${mod}\n` : ''}${rules ? `BUSINESS RULES:\n${rules}` : ''}`
 
     try {
-      const r = await fetch('/api/chat', {
-        method:'POST', headers:{ 'Content-Type':'application/json' },
-        body: JSON.stringify({
-          model:'claude-sonnet-4-20250514',
-          max_tokens: 16000,           // bumped from 4096 — 6 structured outputs need headroom
-          system: prompt,
-          messages:[{ role:'user', content:userMsg }],
-        }),
+      const fullText = await streamChat({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 16000,
+        system: prompt,
+        messages: [{ role: 'user', content: userMsg }],
+        onDelta: (_delta, accumulated) => setStreamPreview(accumulated),
       })
 
-      // Read as text first so we can see what came back even if it isn't JSON
-      const raw = await r.text()
-      let data
-      try {
-        data = JSON.parse(raw)
-      } catch {
-        console.error('Non-JSON response from /api/chat:', raw)
-        throw new Error(`Server returned a non-JSON response: ${raw.slice(0, 200)}`)
-      }
-
-      if (!r.ok) {
-        throw new Error(data?.error?.message || data?.error || `HTTP ${r.status}`)
-      }
-
-      // Anthropic returns { content: [{ type: 'text', text: '...' }, ...] }
-      if (!data.content || !Array.isArray(data.content)) {
-        console.error('Unexpected response shape from /api/chat:', data)
-        throw new Error(data?.error || 'Anthropic returned an unexpected response shape')
-      }
-
-      const text = data.content.map(b => b.text || '').join('').trim()
-      if (!text) throw new Error('Anthropic returned an empty response')
-
-      // Strip markdown fences if present
-      const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim()
-
-      let parsed
-      try {
-        parsed = JSON.parse(cleaned)
-      } catch {
-        console.error('Failed to parse Claude response as JSON. Raw text:', text)
-        // Recover: try to find a JSON object inside the text (Claude sometimes wraps with prose)
-        const match = cleaned.match(/\{[\s\S]*\}/)
-        if (match) {
-          try { parsed = JSON.parse(match[0]) }
-          catch { throw new Error(`Response was not valid JSON. First 200 chars: ${text.slice(0, 200)}`) }
-        } else {
-          throw new Error(`Response was not valid JSON. First 200 chars: ${text.slice(0, 200)}`)
-        }
-      }
-
+      const parsed = extractJson(fullText)
       setResult(parsed)
+      setStreamPreview('')
 
       // Auto-save to memory
       try {
@@ -325,6 +377,7 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
       } catch (e) { /* non-fatal */ }
     } catch (e) {
       setError(e.message)
+      setStreamPreview('')
     } finally {
       setLoading(false)
     }
@@ -333,6 +386,7 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
   function handleClear() {
     setDesc(''); setNotes(''); setMod(''); setRules('')
     setResult(null); setError(''); setActiveTab('understanding')
+    setCurrentSessionId(null)
   }
 
   function exportAll() {
@@ -366,6 +420,10 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
         @keyframes ima-fade-up {
           from { opacity:0; transform: translateY(8px) } to { opacity:1; transform: translateY(0) }
         }
+        @keyframes ima-blink { 50% { opacity: 0; } }
+        .ima-history-row:hover { background: #fafbfc !important; }
+        .ima-history-row:hover .ima-history-del { opacity: 1; }
+        .ima-history-del:hover { background: #fef2f2; color: #b91c1c; }
         .ima-fade-up { animation: ima-fade-up 0.35s ease-out both }
         .ima-input:focus, .ima-select:focus, .ima-ta:focus {
           outline: none; border-color: ${NAVY};
@@ -511,7 +569,135 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
                 ? <span>Add a story description to begin</span>
                 : <span style={{ color:'#15803d' }}>✓ Ready to analyse</span>}
             </div>
-            <div style={{ display:'flex', gap:10 }}>
+            <div style={{ display:'flex', gap:10, position:'relative' }}>
+              {/* History button */}
+              <button
+                ref={historyBtnRef}
+                onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) loadHistory() }}
+                disabled={loading}
+                style={{
+                  display:'inline-flex', alignItems:'center', gap:6,
+                  padding:'10px 14px', fontSize:12.5, fontWeight:500,
+                  background: historyOpen ? `${NAVY}10` : '#fff',
+                  color: historyOpen ? NAVY : MUTED,
+                  border:`1px solid ${historyOpen ? NAVY : BORDER}`,
+                  borderRadius:7,
+                  cursor: loading ? 'not-allowed' : 'pointer', fontFamily:'inherit',
+                  transition:'all 0.15s',
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                  <path d="M8 4v4l3 2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                  <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.4"/>
+                </svg>
+                History
+                {history.length > 0 && (
+                  <span style={{
+                    fontSize:10, fontWeight:600,
+                    background: historyOpen ? `${NAVY}20` : '#f1f5f9',
+                    color: historyOpen ? NAVY : MUTED,
+                    padding:'1px 6px', borderRadius:10, minWidth:16, textAlign:'center',
+                  }}>{history.length}</span>
+                )}
+              </button>
+
+              {/* History dropdown */}
+              {historyOpen && (
+                <div
+                  ref={historyDropdownRef}
+                  className="ima-fade-up"
+                  style={{
+                    position:'absolute', top:'100%', right:0, marginTop:8, zIndex:50,
+                    width:380, maxHeight:440, overflowY:'auto',
+                    background:'#fff', border:`1px solid ${BORDER}`,
+                    borderRadius:10, boxShadow:'0 8px 24px rgba(15,23,42,0.12)',
+                  }}
+                >
+                  <div style={{
+                    padding:'12px 16px', borderBottom:`1px solid ${BORDER_SOFT}`,
+                    display:'flex', alignItems:'center', justifyContent:'space-between',
+                    position:'sticky', top:0, background:'#fff', zIndex:1,
+                  }}>
+                    <span style={{ fontSize:12, fontWeight:600, color:TEXT }}>Recent diagnoses</span>
+                    <span style={{ fontSize:10.5, color:MUTED }}>
+                      {historyLoading ? 'Loading…' : `${history.length} saved`}
+                    </span>
+                  </div>
+                  {history.length === 0 && !historyLoading && (
+                    <div style={{
+                      padding:'32px 20px', textAlign:'center', fontSize:12, color:MUTED,
+                    }}>
+                      No diagnoses saved yet.<br/>
+                      <span style={{ color:'#94a3b8', fontSize:11 }}>
+                        Generate one and it'll appear here.
+                      </span>
+                    </div>
+                  )}
+                  {history.map(h => {
+                    const isCurrent = currentSessionId === h.id
+                    const date = new Date(h.updated_at)
+                    const dateStr = date.toLocaleDateString(undefined, { month:'short', day:'numeric' })
+                    const timeStr = date.toLocaleTimeString(undefined, { hour:'numeric', minute:'2-digit' })
+                    return (
+                      <div
+                        key={h.id}
+                        onClick={() => loadDiagnosis(h.id)}
+                        className="ima-history-row"
+                        style={{
+                          padding:'12px 16px', cursor:'pointer',
+                          borderBottom:`1px solid ${BORDER_SOFT}`,
+                          background: isCurrent ? `${NAVY}08` : 'transparent',
+                          transition:'background 0.12s',
+                          display:'flex', alignItems:'flex-start', gap:10,
+                          textAlign:'left',
+                        }}
+                      >
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{
+                            fontSize:12.5, fontWeight: isCurrent ? 600 : 500,
+                            color: isCurrent ? NAVY : TEXT,
+                            lineHeight:1.4, marginBottom:4,
+                            overflow:'hidden', textOverflow:'ellipsis',
+                            display:'-webkit-box', WebkitLineClamp:2, WebkitBoxOrient:'vertical',
+                          }}>
+                            {h.title || 'Untitled diagnosis'}
+                          </div>
+                          <div style={{
+                            fontSize:10.5, color:MUTED,
+                            display:'flex', alignItems:'center', gap:6,
+                          }}>
+                            <span>{dateStr}</span>
+                            <span style={{ opacity:0.5 }}>·</span>
+                            <span>{timeStr}</span>
+                            {isCurrent && (
+                              <>
+                                <span style={{ opacity:0.5 }}>·</span>
+                                <span style={{ color:NAVY, fontWeight:600 }}>Current</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          onClick={(e) => deleteDiagnosis(h.id, e)}
+                          aria-label="Delete"
+                          className="ima-history-del"
+                          style={{
+                            background:'transparent', border:'none', cursor:'pointer',
+                            padding:4, color:'#94a3b8', borderRadius:4,
+                            display:'flex', alignItems:'center', justifyContent:'center',
+                            opacity:0, transition:'opacity 0.15s, background 0.15s, color 0.15s',
+                          }}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                            <path d="M3 4h10M6 4V2.5a1 1 0 011-1h2a1 1 0 011 1V4M5 4l1 9.5a1 1 0 001 1h2a1 1 0 001-1L11 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                          </svg>
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
               {(desc || notes || rules || mod) && (
                 <button
                   onClick={handleClear}
@@ -542,7 +728,7 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
                 }}
               >
                 {loading && <Spinner />}
-                {loading ? 'Analysing story…' : 'Generate diagnosis'}
+                {loading ? 'Analysing story…' : (currentSessionId ? 'Regenerate' : 'Generate diagnosis')}
               </button>
             </div>
           </div>
@@ -572,28 +758,46 @@ export default function DiagnoseStory({ memories, onMemoryChange }) {
           </div>
         )}
 
-        {/* ─── Loading skeleton ───────────────────────────────────── */}
+        {/* ─── Streaming preview ──────────────────────────────────── */}
         {loading && (
           <div className="ima-fade-up" style={{
             marginTop:24, padding:'28px 30px', background:'#fff',
             border:`1px solid ${BORDER}`, borderRadius:12,
           }}>
-            <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:20 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom: streamPreview ? 16 : 20 }}>
               <Spinner size={18} color={NAVY} />
               <div>
                 <div style={{ fontSize:14, fontWeight:600, color:TEXT }}>
-                  Analysing your story…
+                  {streamPreview ? 'Writing diagnosis…' : 'Analysing your story…'}
                 </div>
                 <div style={{ fontSize:11.5, color:MUTED, marginTop:2 }}>
-                  Cross-referencing {BPML_SCRIPTS.length} BPML scripts and IMA360 architecture
+                  {streamPreview
+                    ? `${streamPreview.length.toLocaleString()} characters · streaming live`
+                    : `Cross-referencing ${BPML_SCRIPTS.length} BPML scripts and IMA360 architecture`}
                 </div>
               </div>
             </div>
-            <Skeleton height={12} width="40%" />
-            <Skeleton height={12} width="85%" />
-            <Skeleton height={12} width="70%" />
-            <Skeleton height={12} width="92%" />
-            <Skeleton height={12} width="55%" mb={0} />
+            {streamPreview ? (
+              <pre style={{
+                margin:0, padding:'14px 16px', background:'#fafbfc',
+                border:`1px solid ${BORDER_SOFT}`, borderRadius:8,
+                fontSize:11.5, lineHeight:1.55, color:'#475569',
+                fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',
+                whiteSpace:'pre-wrap', wordBreak:'break-word',
+                maxHeight:280, overflow:'auto',
+              }}>
+                {streamPreview.slice(-1500)}
+                <span style={{ display:'inline-block', width:6, height:13, background:NAVY, marginLeft:2, animation:'ima-blink 0.8s steps(2) infinite', verticalAlign:'middle' }} />
+              </pre>
+            ) : (
+              <>
+                <Skeleton height={12} width="40%" />
+                <Skeleton height={12} width="85%" />
+                <Skeleton height={12} width="70%" />
+                <Skeleton height={12} width="92%" />
+                <Skeleton height={12} width="55%" mb={0} />
+              </>
+            )}
           </div>
         )}
 
@@ -1026,6 +1230,14 @@ function BpmlPanel({ scripts }) {
   return (
     <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(320px, 1fr))', gap:10 }}>
       {scripts.map((s, i) => {
+        // Look up the canonical script entry by ID — never trust Claude's driveLink/scriptName,
+        // which it tends to hallucinate. Always source from BPML_SCRIPTS (same as Script Navigator).
+        const canonical = BPML_SCRIPTS.find(x => x.id === s.id)
+        const driveLink = canonical?.driveLink || ''
+        const scriptName = canonical?.script || s.scriptName
+        const moduleName = canonical?.module
+        const submenu = canonical?.submenu
+
         const rc = REL_C[s.relevance] || REL_C.related
         const actC = s.action === 'new-script-needed'
           ? { bg:'#fef2f2', fg:'#991b1b' }
@@ -1042,23 +1254,30 @@ function BpmlPanel({ scripts }) {
               <Pill bg={rc.bg} fg={rc.fg}>{s.relevance}</Pill>
               {s.action && <Pill bg={actC.bg} fg={actC.fg}>{s.action.replace(/-/g, ' ')}</Pill>}
             </div>
-            {s.scriptName && (
+            {(moduleName || submenu) && (
+              <div style={{
+                fontSize:11, color:MUTED, marginBottom:6,
+              }}>
+                {[moduleName, submenu].filter(Boolean).join(' · ')}
+              </div>
+            )}
+            {scriptName && (
               <div style={{
                 fontSize:11, color:MUTED, marginBottom:8,
                 fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',
                 wordBreak:'break-word',
               }}>
-                {s.scriptName}
+                {scriptName}
               </div>
             )}
             <div style={{
-              fontSize:12, color:'#334155', lineHeight:1.55, marginBottom: s.driveLink ? 12 : 0,
+              fontSize:12, color:'#334155', lineHeight:1.55, marginBottom:12,
             }}>
               {s.reason}
             </div>
-            {s.driveLink && (
+            {driveLink ? (
               <a
-                href={s.driveLink} target="_blank" rel="noopener noreferrer"
+                href={driveLink} target="_blank" rel="noopener noreferrer"
                 style={{
                   display:'inline-flex', alignItems:'center', gap:5,
                   fontSize:11, fontWeight:500, padding:'5px 10px',
@@ -1069,6 +1288,15 @@ function BpmlPanel({ scripts }) {
               >
                 Open in Drive ↗
               </a>
+            ) : (
+              <span style={{
+                display:'inline-flex', alignItems:'center', gap:5,
+                fontSize:11, fontWeight:500, padding:'5px 10px',
+                background:'#fafbfc', color:'#94a3b8',
+                border:`1px solid ${BORDER_SOFT}`, borderRadius:5,
+              }}>
+                No Drive link on file
+              </span>
             )}
           </div>
         )
